@@ -2,8 +2,11 @@
 
 from __future__ import division
 
-import gurobipy as grb
-GRB = grb.GRB # constants for gurobi
+try:
+    import gurobipy as grb
+    GRB = grb.GRB # constants for gurobi
+except ImportError:
+    print 'Failed to import Gurobi, some solvers may not work'
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
@@ -12,7 +15,6 @@ from sklearn.svm import SVC
 
 
 import sys, os
-import re
 eps = 10**-8
 MAX_ITER=1000
 
@@ -46,19 +48,22 @@ class SVMRetVal(object):
 
     def set_particle(self, n, mu, R, update=False):
         self.mu[n] = mu
-        for i in range(1, self.T):
-            self.phi[n, i] = self.feats.feature(R[:i])
+        self.phi[n, 1:] = self.feats.all_features(R)
+        # for i in range(1, self.T):
+        #     self.phi[n, i] = self.feats.feature(R[:i])
         
+    # @profile
     def solve(self):
         max_nu = np.max(self.mu)
         min_nu = np.mean(self.mu)
         nu = (max_nu + min_nu) / 2
-        while (max_nu - min_nu) > self.tol:            
-            if self.ret_val(nu) > nu:
+        while (max_nu - min_nu) > self.tol:
+            ret_val = self.ret_val(nu)
+            if ret_val > nu:
                 # below GI
-                min_nu = nu
+                min_nu = ret_val
             else: # self.ret_val(nu) == nu
-                max_nu = nu
+                max_nu = ret_val
             nu = (max_nu + min_nu) / 2
         return nu
 
@@ -70,7 +75,7 @@ class SVMRetVal(object):
         # decision. It seems like this should be asymetric, but 
         # for some reason this performs better (in terms of MSE for Bernoulli)
         # Cost for retiring early is 
-        # (self.mu - lmda) / (1-gamma)
+        # (self.mu - lmbda) / (1-gamma)
         weights = np.abs(self.mu - lmbda)
         T = min(self.T, self.FH)
         # default to never stopping
@@ -91,7 +96,79 @@ class SVMRetVal(object):
         avg_reward = np.mean(self.mu * denoms[self.tau - 1])
         avg_time   = np.mean(denoms[self.tau - 1])
 
-        return np.maximum(avg_reward / avg_rate, lmbda)                
+        return np.maximum(avg_reward / avg_time, lmbda)                
+
+class SVMRetValv2(SVMRetVal):
+
+    def __init__(self, gamma, feats, T, N, FH=np.inf, 
+                 tol=1e-3):
+        super(SVMRetValv2, self).__init__(gamma, feats, T, N, FH, tol)
+        self.R   = np.zeros( (N, T) )
+        self.ub  = None
+        self.lb  = None
+
+    # @profile
+    def set_particle(self, n, mu, R, update=False):
+        self.mu[n] = mu
+        self.phi[n, 1:] = self.feats.all_features(R)
+        self.R[n] = R
+        
+
+    # @profile
+    def ret_val(self, lmbda):
+        # initialize with the policy that tries
+        # to retire bad particles initially
+        Y = self.mu > lmbda
+        weights = np.abs(self.mu - lmbda)
+
+        T = min(self.T, self.FH)
+        # default to never stopping
+        self.tau = np.ones(self.N, dtype=np.int) * T
+
+        alive = np.ones(self.N, dtype=np.bool)
+        denoms = np.cumsum(np.power(self.gamma, xrange(T)))
+
+        print lmbda, self.mu
+
+        for t in range(1, T):
+            if len(np.unique(Y[alive])) <=1:
+                # we can terminate early
+                break
+            self.clf.fit(self.phi[alive, t], Y[alive], weights[alive])
+            # predict 1 means continue
+            retired = 1 - self.clf.predict(self.phi[alive, t])
+            # keep track of when particles retire
+            self.tau[alive] = retired*t + (1-retired)*self.tau[alive]
+            alive = (self.tau == T)
+        print "after first pass", self.tau
+        
+        Q = np.zeros(self.N)
+        for k in range(3): ##TODO Set Convergence
+            Q[:] = lmbda
+            Q[self.tau==T] = self.R[self.tau==T, T-1]
+            for t in range(T-1, 1, -1):
+                alive = self.tau > t
+                Q_continue = self.gamma * Q + self.R[:, t]
+                Q_ret = lmbda * denoms[-t]
+                Y = Q_continue > Q_ret
+                weights = np.abs(Q_continue - Q_ret)
+                if len(np.unique(Y[alive])) > 1:
+                    self.clf.fit(self.phi[alive, t], Y[alive], weights[alive])                
+                    # predict 1 means continue
+                    retired = 1 - self.clf.predict(self.phi[alive, t])
+                else: #all retire or all continue
+                    retired = 1 - Y[alive]
+                # keep track of when particles retire
+                self.tau[alive] = retired*t + (1-retired)*self.tau[alive]
+                Q = Q_continue
+                Q[alive][retired] = Q_ret
+                
+        print "after backwards pass", self.tau
+
+        avg_reward = np.mean(self.mu * denoms[self.tau - 1])
+        avg_time   = np.mean(denoms[self.tau - 1])
+
+        return np.maximum(avg_reward / avg_time, lmbda)
 
 def gi_outer_loop(ret_val_fn, tol=eps, max_iter = 500):
     nu = 0
